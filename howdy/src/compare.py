@@ -33,6 +33,12 @@ def exit(code=None):
 	# Exit the auth ui process if there is one
 	if "gtk_proc" in globals():
 		gtk_proc.terminate()
+  
+	# Destroy all windows on exit
+	try:
+		cv2.destroyAllWindows()
+	except Exception:
+		pass
 
 	# Exit compare
 	if code is not None:
@@ -95,6 +101,81 @@ def send_to_ui(type, message):
 		except IOError:
 			pass
 
+def get_user_display(username):
+	"""
+	During sudo/lock screen: scan the authenticating user's processes for DISPLAY.
+	During login (GDM): the user has no session yet, so fall back to the gdm
+	user's display, which owns the login screen.
+	"""
+	import glob
+	import pwd
+
+	if os.environ.get("DISPLAY"):
+		return os.environ.get("DISPLAY"), os.environ.get("XAUTHORITY")
+
+	def scan_user(name):
+		#Scan /proc for a process owned by `name` that has DISPLAY set.
+		try:
+			uid = pwd.getpwnam(name).pw_uid
+		except KeyError:
+			return None, None
+
+		for pid_dir in glob.glob("/proc/[0-9]*"):
+			try:
+				if os.stat(pid_dir).st_uid != uid:
+					continue
+				with open(os.path.join(pid_dir, "environ"), "rb") as f:
+					env = {}
+					for item in f.read().split(b"\x00"):
+						if b"=" in item:
+							k, v = item.split(b"=", 1)
+							env[k.decode(errors="replace")] = v.decode(errors="replace")
+				if "DISPLAY" in env:
+					return env["DISPLAY"], env.get("XAUTHORITY")
+			except (PermissionError, FileNotFoundError, ValueError, OSError):
+				continue
+		return None, None
+
+	# First try the authenticating user (covers sudo, lock screen)
+	display, xauth = scan_user(username)
+	if display:
+		return display, xauth
+
+	# Fall back to gdm's session (covers login screen)
+	display, xauth = scan_user("gdm")
+	if display:
+		# GDM's Xauthority is not always in its process environment.
+		# Check the standard location if the process scan didn't find it.
+		if not xauth:
+			for pattern in ["/run/gdm3/auth-for-gdm*/database", "/var/run/gdm3/auth-for-gdm*/database"]:
+				matches = glob.glob(pattern)
+				if matches:
+					xauth = matches[0]
+					break
+		return display, xauth
+
+	# Second fallback: find the X socket and GDM auth file directly on disk
+	import glob as _glob
+
+	sockets = sorted(_glob.glob("/tmp/.X11-unix/X*"))
+	if sockets:
+		display = ":" + sockets[0].rsplit("X", 1)[-1]  # → ":1"
+
+		xauth = None
+		for pattern in [
+			"/run/user/*/gdm/Xauthority",       # ← your system
+			"/run/gdm3/auth-for-gdm*/database",
+			"/var/run/gdm3/auth-for-gdm*/database",
+		]:
+			matches = _glob.glob(pattern)
+			if matches:
+				xauth = matches[0]
+				break
+
+		if xauth:
+			return display, xauth
+
+	return None, None
 
 # Make sure we were given an username to test against
 if len(sys.argv) < 2:
@@ -120,6 +201,7 @@ lowest_certainty = 10
 face_detector = None
 pose_predictor = None
 face_encoder = None
+
 
 # Try to load the face model from the models folder
 try:
@@ -148,6 +230,7 @@ save_failed = config.getboolean("snapshots", "save_failed", fallback=False)
 save_successful = config.getboolean("snapshots", "save_successful", fallback=False)
 gtk_stdout = config.getboolean("debug", "gtk_stdout", fallback=False)
 rotate = config.getint("video", "rotate", fallback=0)
+show_window = config.getboolean("video", "show_window", fallback=False) # Show window
 
 # Send the gtk output to the terminal if enabled in the config
 gtk_pipe = sys.stdout if gtk_stdout else subprocess.DEVNULL
@@ -206,6 +289,88 @@ end_report = config.getboolean("debug", "end_report", fallback=False)
 
 # Initiate histogram equalization
 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
+# PAM strips the environment, so cv2.imshow() would fail with
+# "cannot connect to X server" unless we restore DISPLAY/XAUTHORITY
+# from the authenticating user's session.
+#
+# During GDM login the PAM process runs as root, which is not in the
+# X server's access control list even when DISPLAY/XAUTHORITY are set
+# correctly. We fix this by calling "xauth merge" so root inherits
+# GDM's magic cookie, then probe the connection with xdpyinfo before
+# creating any window. A broad try/except ensures a display failure
+# never blocks authentication.
+_window_ready = False
+if show_window:
+	try:
+		display, xauthority = get_user_display(user)
+
+		if display:
+			os.environ["DISPLAY"] = display
+			if xauthority:
+				os.environ["XAUTHORITY"] = xauthority
+
+				# Merge GDM's Xauth cookie into root's keyring so the
+				# PAM process (running as root) is allowed to open the
+				# X server that GDM owns.
+				subprocess.run(
+					["xauth", "merge", xauthority],
+					stdout=subprocess.DEVNULL,
+					stderr=subprocess.DEVNULL
+				)
+
+			# Qt / OpenCV need XDG_RUNTIME_DIR. Derive it from the
+			# authenticating user's UID — /run/user/<uid> is the standard
+			# location set by systemd-logind.
+			import pwd
+			uid = pwd.getpwnam(user).pw_uid
+			xdg_runtime = f"/run/user/{uid}"
+			if os.path.isdir(xdg_runtime):
+				os.environ["XDG_RUNTIME_DIR"] = xdg_runtime
+
+			# Probe the X connection before creating any window.
+			# If this fails (e.g. cookie mismatch) we disable the window
+			# and log the reason so it can be diagnosed without breaking auth.
+			probe = subprocess.run(
+				["xdpyinfo"],
+				stdout=subprocess.DEVNULL,
+				stderr=subprocess.PIPE
+			)
+			if probe.returncode != 0:
+				with open("/var/log/howdy-window.log", "a") as f:
+					f.write(
+						f"{datetime.now(timezone.utc).isoformat()} "
+						f"xdpyinfo probe failed: {probe.stderr.decode(errors='replace').strip()}\n"
+					)
+				show_window = False
+			else:
+				# Create a named window so we can control its properties
+				cv2.namedWindow("Howdy", cv2.WINDOW_GUI_NORMAL)
+				cv2.resizeWindow("Howdy", 640, 360)
+				cv2.setWindowTitle("Howdy", "Howdy - identifying you")
+				cv2.setWindowProperty("Howdy", cv2.WND_PROP_TOPMOST, 1)
+				_window_ready = True
+		else:
+			# No display found — silently disable the window so auth still works
+			with open("/var/log/howdy-window.log", "a") as f:
+				f.write(
+					f"{datetime.now(timezone.utc).isoformat()} "
+					f"get_user_display returned no display for user '{user}'\n"
+				)
+			show_window = False
+
+	except Exception as e:
+		# Log the real error so future failures can be diagnosed
+		try:
+			with open("/var/log/howdy-window.log", "a") as f:
+				f.write(
+					f"{datetime.now(timezone.utc).isoformat()} "
+					f"window init exception: {e}\n"
+				)
+		except Exception:
+			pass
+		show_window = False
 
 # Let the ui know that we're ready
 send_to_ui("M", _("Identifying you..."))
@@ -377,6 +542,113 @@ while True:
 
 			# End peacefully
 			exit(0)
+  
+	# We render after the recognition loop so we can annotate:
+	#   • green circle  = face detected, currently matching
+	#   • orange circle = face detected, not yet matching
+	#   • certainty     = best score so far (lower = more certain, shown ×10)
+	#   • frame info    = elapsed time and frame count
+	#
+	# The entire block is wrapped in try/except — a display hiccup must
+	# never cause authentication to fail.
+	#
+	if show_window and _window_ready:
+		try:
+			display_frame = frame.copy()
+
+			if display_frame.ndim == 2:
+				display_frame = cv2.cvtColor(display_frame, cv2.COLOR_GRAY2BGR)
+
+			elapsed = round(time.time() - timings["fr"], 1)
+			is_match_found = lowest_certainty < video_certainty
+
+			for fl in face_locations:
+				if use_cnn:
+					fl = fl.rect
+
+				box_color = (0, 255, 0) if is_match_found else (0, 165, 255)
+
+				# Compute circle center and radius from the bounding box
+				cx = (fl.left() + fl.right()) // 2
+				cy = (fl.top() + fl.bottom()) // 2
+				radius = max(fl.right() - fl.left(), fl.bottom() - fl.top()) // 2 + 8
+
+				cv2.circle(display_frame, (cx, cy), radius, box_color, 2)
+
+				label = "Matched" if is_match_found else "Scanning"
+				cv2.putText(
+					display_frame, label,
+					(cx - 30, cy - radius - 8),
+					cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1,
+					cv2.LINE_AA
+				)
+
+			if lowest_certainty < 10:
+				certainty_display = round(lowest_certainty * 10, 1)
+				hud_color = (0, 255, 0) if is_match_found else (200, 200, 200)
+				cv2.putText(
+					display_frame,
+					f"Certainty: {certainty_display}  (need < {round(video_certainty * 10, 1)})",
+					(8, 20),
+					cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_color, 1,
+					cv2.LINE_AA
+				)
+
+			cv2.putText(
+				display_frame,
+				f"Frame {frames}  |  {elapsed}s elapsed",
+				(8, display_frame.shape[0] - 8),
+				cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1,
+				cv2.LINE_AA
+			)
+
+			cv2.imshow("Howdy", display_frame)
+			cv2.waitKey(1)
+
+			# On the first rendered frame, force the window above GDM's shell.
+			# We set _NET_WM_STATE_ABOVE via xprop (which talks to the X server
+			# directly) and then raise the window with xdotool. Both tools must
+			# be installed: apt install x11-utils xdotool
+			if frames == 1:
+				try:
+					wid_result = subprocess.run(
+						["xdotool", "search", "--name", "Howdy"],
+						capture_output=True,
+						text=True
+					)
+					wid = wid_result.stdout.strip().split("\n")[0]
+					if wid:
+						# Set ABOVE + STAYS_ON_TOP so gnome-shell's compositor
+						# cannot bury the window beneath the login screen.
+						subprocess.Popen(
+							[
+								"xprop", "-id", wid,
+								"-f", "_NET_WM_STATE", "32a",
+								"-set", "_NET_WM_STATE",
+								"_NET_WM_STATE_ABOVE,_NET_WM_STATE_STAYS_ON_TOP"
+							],
+							stdout=subprocess.DEVNULL,
+							stderr=subprocess.DEVNULL
+						)
+						subprocess.Popen(
+							["xdotool", "windowraise", wid],
+							stdout=subprocess.DEVNULL,
+							stderr=subprocess.DEVNULL
+						)
+				except FileNotFoundError:
+					pass  # xdotool / xprop not installed — skip silently
+
+		except Exception as e:
+			# Log window rendering errors without interrupting auth
+			try:
+				with open("/var/log/howdy-window.log", "a") as f:
+					f.write(
+						f"{datetime.now(timezone.utc).isoformat()} "
+						f"window render exception: {e}\n"
+					)
+			except Exception:
+				pass
+			show_window = False
 
 	if exposure != -1:
 		# For a strange reason on some cameras (e.g. Lenoxo X1E) setting manual exposure works only after a couple frames
