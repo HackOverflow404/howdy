@@ -4,5 +4,5 @@
   "uuid": "howdy-screen@howdy",
   "shell-version": ["45", "46", "47", "48"],
   "session-modes": ["user", "unlock-dialog", "gdm"],
-  "version": 2
+  "version": 3
 }
