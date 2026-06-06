@@ -131,16 +131,22 @@ export default class HowdyCameraOverlay {
         if (!this._frame)
             return;
 
-        // Only reload when the file's mtime actually changed.
-        let mtime;
+        // Only reload when the file's mtime actually changed. Use
+        // microsecond resolution: compare.py writes several frames per
+        // second, so whole-second mtime (the obvious to_unix()) would
+        // collapse them to one and cap the overlay at ~1 FPS.
+        let stamp;
         try {
             const info = Gio.File.new_for_path(FRAME_FILE).query_info(
-                'time::modified', Gio.FileQueryInfoFlags.NONE, null);
-            mtime = info.get_modification_date_time()?.to_unix() ?? 0;
+                'time::modified,time::modified-usec',
+                Gio.FileQueryInfoFlags.NONE, null);
+            const secs = info.get_attribute_uint64('time::modified');
+            const usec = info.get_attribute_uint32('time::modified-usec');
+            stamp = secs * 1000000 + usec;
         } catch (_) {
             return; // frame not written yet
         }
-        if (mtime === this._frameTime)
+        if (stamp === this._frameTime)
             return;
 
         let pixbuf;
@@ -149,7 +155,7 @@ export default class HowdyCameraOverlay {
         } catch (_) {
             return; // mid-write / momentarily unreadable — retry next tick
         }
-        this._frameTime = mtime;
+        this._frameTime = stamp;
 
         const w = pixbuf.get_width();
         const h = pixbuf.get_height();
