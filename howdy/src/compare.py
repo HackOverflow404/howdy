@@ -33,7 +33,15 @@ def exit(code=None):
 	# Exit the auth ui process if there is one
 	if "gtk_proc" in globals():
 		gtk_proc.terminate()
-  
+
+	# Remove the active-auth signal file so the GNOME Shell extension
+	# knows authentication has ended and closes the camera overlay.
+	for _f in ("/tmp/howdy-active", "/tmp/howdy-frame.jpg", "/tmp/howdy-frame.jpg.tmp"):
+		try:
+			os.remove(_f)
+		except Exception:
+			pass
+
 	# Destroy all windows on exit
 	try:
 		cv2.destroyAllWindows()
@@ -95,11 +103,12 @@ def send_to_ui(type, message):
 
 		# Try to send the message to the auth ui, but it's okay if that fails
 		try:
-			if gtk_proc.poll() is None: # Make sure the gtk_proc is still running before write into the pipe
+			if gtk_proc.poll() is None:
 				gtk_proc.stdin.write(bytearray(message.encode("utf-8")))
 				gtk_proc.stdin.flush()
 		except IOError:
 			pass
+
 
 def get_user_display(username):
 	"""
@@ -114,7 +123,6 @@ def get_user_display(username):
 		return os.environ.get("DISPLAY"), os.environ.get("XAUTHORITY")
 
 	def scan_user(name):
-		#Scan /proc for a process owned by `name` that has DISPLAY set.
 		try:
 			uid = pwd.getpwnam(name).pw_uid
 		except KeyError:
@@ -144,8 +152,6 @@ def get_user_display(username):
 	# Fall back to gdm's session (covers login screen)
 	display, xauth = scan_user("gdm")
 	if display:
-		# GDM's Xauthority is not always in its process environment.
-		# Check the standard location if the process scan didn't find it.
 		if not xauth:
 			for pattern in ["/run/gdm3/auth-for-gdm*/database", "/var/run/gdm3/auth-for-gdm*/database"]:
 				matches = glob.glob(pattern)
@@ -155,19 +161,17 @@ def get_user_display(username):
 		return display, xauth
 
 	# Second fallback: find the X socket and GDM auth file directly on disk
-	import glob as _glob
-
-	sockets = sorted(_glob.glob("/tmp/.X11-unix/X*"))
+	sockets = sorted(glob.glob("/tmp/.X11-unix/X*"))
 	if sockets:
-		display = ":" + sockets[0].rsplit("X", 1)[-1]  # → ":1"
+		display = ":" + sockets[0].rsplit("X", 1)[-1]
 
 		xauth = None
 		for pattern in [
-			"/run/user/*/gdm/Xauthority",       # ← your system
+			"/run/user/*/gdm/Xauthority",
 			"/run/gdm3/auth-for-gdm*/database",
 			"/var/run/gdm3/auth-for-gdm*/database",
 		]:
-			matches = _glob.glob(pattern)
+			matches = glob.glob(pattern)
 			if matches:
 				xauth = matches[0]
 				break
@@ -176,6 +180,121 @@ def get_user_display(username):
 			return display, xauth
 
 	return None, None
+
+
+def render_frame_to_window(display_frame, face_locs, is_match_found, is_too_dark, darkness, elapsed, do_imshow=True):
+	"""
+	Draw annotations onto display_frame and always write the frame as a JPEG
+	for the GNOME Shell lock-screen / greeter extension to pick up.
+
+	The annotation drawing and JPEG encode are pure numpy/OpenCV and need no
+	display, so they run everywhere. Only cv2.imshow() needs an X server, so it
+	is gated by do_imshow — at the Wayland GDM greeter we still want the JPEG
+	frames for the extension even though no OpenCV window can be drawn.
+	Called both from the main loop and from the winning-frame path before exit(0).
+	"""
+	if display_frame.ndim == 2:
+		display_frame = cv2.cvtColor(display_frame, cv2.COLOR_GRAY2BGR)
+
+	if is_too_dark:
+		cv2.putText(
+			display_frame,
+			f"Too dark ({round(darkness, 1)} > threshold {round(dark_threshold, 1)}) — adjust lighting",
+			(8, 20),
+			cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 80, 220), 1, cv2.LINE_AA
+		)
+	else:
+		for fl in face_locs:
+			if use_cnn:
+				fl = fl.rect
+
+			box_color = (0, 255, 0) if is_match_found else (0, 165, 255)
+			cx = (fl.left() + fl.right()) // 2
+			cy = (fl.top() + fl.bottom()) // 2
+			radius = max(fl.right() - fl.left(), fl.bottom() - fl.top()) // 2 + 8
+
+			cv2.circle(display_frame, (cx, cy), radius, box_color, 2)
+
+			label = "Matched!" if is_match_found else "Scanning"
+			cv2.putText(
+				display_frame, label,
+				(cx - 30, cy - radius - 8),
+				cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1, cv2.LINE_AA
+			)
+
+		if lowest_certainty < 10:
+			certainty_display = round(lowest_certainty * 10, 1)
+			hud_color = (0, 255, 0) if is_match_found else (200, 200, 200)
+			cv2.putText(
+				display_frame,
+				f"Certainty: {certainty_display}  (need < {round(video_certainty * 10, 1)})",
+				(8, 20),
+				cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_color, 1, cv2.LINE_AA
+			)
+
+	cv2.putText(
+		display_frame,
+		f"Frame {frames}  |  {elapsed}s elapsed",
+		(8, display_frame.shape[0] - 8),
+		cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA
+	)
+
+	# The OpenCV window only exists/works when we have a usable X display.
+	if do_imshow:
+		cv2.imshow("Howdy", display_frame)
+		cv2.waitKey(1)
+
+	# Write the current frame as JPEG for the GNOME Shell lock-screen extension.
+	# Uses a temp file + atomic rename so the extension never reads a partial JPEG.
+	try:
+		_ok, _buf = cv2.imencode(".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+		if _ok:
+			with open("/tmp/howdy-frame.jpg.tmp", "wb") as _fh:
+				_fh.write(_buf.tobytes())
+			os.replace("/tmp/howdy-frame.jpg.tmp", "/tmp/howdy-frame.jpg")
+	except Exception:
+		pass
+
+
+def raise_window_once():
+	"""
+	Raise the Howdy window to the top of the stacking order.
+	Safe to call multiple times — only acts on the first call.
+	Searches by PID so it always finds our own window, not stale ones.
+
+	Note: override_redirect is intentionally NOT used here. It strips WM
+	decorations and causes the camera content to overflow the window boundary.
+	It also has no effect against GNOME Shell's lock screen (Mutter blocks it
+	as a security measure). For lock screen overlay use the GNOME Shell
+	extension (howdy-screen@howdy) instead.
+	"""
+	global _window_raised
+	if _window_raised:
+		return
+	_window_raised = True
+	wlog(f"raise_window_once — raising window (pid={_own_pid})")
+	try:
+		wid_result = subprocess.run(
+			["xdotool", "search", "--pid", str(_own_pid)],
+			capture_output=True, text=True, timeout=2
+		)
+		wids = [w for w in wid_result.stdout.strip().split("\n") if w]
+		wlog(f"xdotool search --pid result: {wids}")
+
+		if wids:
+			wid = wids[-1]
+			raise_result = subprocess.run(
+				["xdotool", "windowraise", wid],
+				capture_output=True, text=True, timeout=2
+			)
+			wlog(f"windowraise exit={raise_result.returncode}")
+		else:
+			wlog("xdotool --pid search found no windows for our pid")
+	except FileNotFoundError:
+		wlog("xdotool not found")
+	except subprocess.TimeoutExpired:
+		wlog("xdotool timed out")
+
 
 # Make sure we were given an username to test against
 if len(sys.argv) < 2:
@@ -230,7 +349,11 @@ save_failed = config.getboolean("snapshots", "save_failed", fallback=False)
 save_successful = config.getboolean("snapshots", "save_successful", fallback=False)
 gtk_stdout = config.getboolean("debug", "gtk_stdout", fallback=False)
 rotate = config.getint("video", "rotate", fallback=0)
-show_window = config.getboolean("video", "show_window", fallback=False) # Show window
+show_window = config.getboolean("video", "show_window", fallback=False)
+# Whether to write /tmp/howdy-frame.jpg for the GNOME Shell extension overlay
+# (lock screen + GDM greeter). Independent of show_window: the greeter has no
+# usable X display for cv2.imshow but still wants the JPEG frames.
+overlay = config.getboolean("video", "overlay", fallback=True)
 
 # Send the gtk output to the terminal if enabled in the config
 gtk_pipe = sys.stdout if gtk_stdout else subprocess.DEVNULL
@@ -301,76 +424,112 @@ clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 # GDM's magic cookie, then probe the connection with xdpyinfo before
 # creating any window. A broad try/except ensures a display failure
 # never blocks authentication.
+
+# Debug log — written at every step. Check with: sudo cat /tmp/howdy-debug.log
+_LOG = "/tmp/howdy-debug.log"
+
+def wlog(msg):
+	"""Append a timestamped line to the debug log, never raises."""
+	try:
+		with open(_LOG, "a") as f:
+			f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
+	except Exception:
+		pass
+
 _window_ready = False
+_window_raised = False
+_own_pid = os.getpid()
+
+wlog(f"=== howdy window init start, user='{user}', show_window={show_window}, pid={_own_pid} ===")
+
 if show_window:
 	try:
+		wlog("calling get_user_display...")
 		display, xauthority = get_user_display(user)
+		wlog(f"get_user_display returned display={display!r}, xauthority={xauthority!r}")
 
 		if display:
 			os.environ["DISPLAY"] = display
+			wlog(f"set DISPLAY={display}")
+
 			if xauthority:
 				os.environ["XAUTHORITY"] = xauthority
+				wlog(f"set XAUTHORITY={xauthority}")
 
-				# Merge GDM's Xauth cookie into root's keyring so the
-				# PAM process (running as root) is allowed to open the
-				# X server that GDM owns.
-				subprocess.run(
-					["xauth", "merge", xauthority],
-					stdout=subprocess.DEVNULL,
-					stderr=subprocess.DEVNULL
-				)
+				# Merge GDM's Xauth cookie into root's keyring so the PAM
+				# process (running as root) is allowed to open GDM's X server.
+				# Hard 2s timeout — the lock file can block for 20+ seconds if
+				# a previous auth process died while holding the write lock.
+				try:
+					merge = subprocess.run(
+						["xauth", "merge", xauthority],
+						stdout=subprocess.PIPE,
+						stderr=subprocess.PIPE,
+						timeout=2
+					)
+					wlog(f"xauth merge exit={merge.returncode} stderr={merge.stderr.decode(errors='replace').strip()!r}")
+				except subprocess.TimeoutExpired:
+					wlog("xauth merge timed out after 2s — continuing anyway")
+			else:
+				wlog("no xauthority file found — skipping xauth merge")
 
-			# Qt / OpenCV need XDG_RUNTIME_DIR. Derive it from the
-			# authenticating user's UID — /run/user/<uid> is the standard
-			# location set by systemd-logind.
 			import pwd
 			uid = pwd.getpwnam(user).pw_uid
 			xdg_runtime = f"/run/user/{uid}"
 			if os.path.isdir(xdg_runtime):
 				os.environ["XDG_RUNTIME_DIR"] = xdg_runtime
-
-			# Probe the X connection before creating any window.
-			# If this fails (e.g. cookie mismatch) we disable the window
-			# and log the reason so it can be diagnosed without breaking auth.
-			probe = subprocess.run(
-				["xdpyinfo"],
-				stdout=subprocess.DEVNULL,
-				stderr=subprocess.PIPE
-			)
-			if probe.returncode != 0:
-				with open("/var/log/howdy-window.log", "a") as f:
-					f.write(
-						f"{datetime.now(timezone.utc).isoformat()} "
-						f"xdpyinfo probe failed: {probe.stderr.decode(errors='replace').strip()}\n"
-					)
-				show_window = False
+				wlog(f"set XDG_RUNTIME_DIR={xdg_runtime}")
 			else:
-				# Create a named window so we can control its properties
-				cv2.namedWindow("Howdy", cv2.WINDOW_GUI_NORMAL)
-				cv2.resizeWindow("Howdy", 640, 360)
-				cv2.setWindowTitle("Howdy", "Howdy - identifying you")
-				cv2.setWindowProperty("Howdy", cv2.WND_PROP_TOPMOST, 1)
-				_window_ready = True
-		else:
-			# No display found — silently disable the window so auth still works
-			with open("/var/log/howdy-window.log", "a") as f:
-				f.write(
-					f"{datetime.now(timezone.utc).isoformat()} "
-					f"get_user_display returned no display for user '{user}'\n"
+				wlog(f"XDG_RUNTIME_DIR path {xdg_runtime} does not exist, skipping")
+
+			wlog("running xdpyinfo probe...")
+			try:
+				probe = subprocess.run(
+					["xdpyinfo"],
+					stdout=subprocess.DEVNULL,
+					stderr=subprocess.PIPE,
+					timeout=3
 				)
+				wlog(f"xdpyinfo exit={probe.returncode} stderr={probe.stderr.decode(errors='replace').strip()!r}")
+			except subprocess.TimeoutExpired:
+				wlog("xdpyinfo timed out — disabling window")
+				show_window = False
+				probe = None
+
+			if show_window and probe is not None and probe.returncode != 0:
+				wlog("xdpyinfo FAILED — disabling window")
+				show_window = False
+			elif show_window:
+				wlog("xdpyinfo OK — creating OpenCV window...")
+				try:
+					# WINDOW_NORMAL lets us set an explicit size so the content
+					# never overflows the window boundary (unlike WINDOW_AUTOSIZE).
+					cv2.namedWindow("Howdy", cv2.WINDOW_NORMAL)
+					cv2.resizeWindow("Howdy", int(max_height * 4 / 3), int(max_height))
+					cv2.setWindowTitle("Howdy", "Howdy - identifying you")
+					cv2.setWindowProperty("Howdy", cv2.WND_PROP_TOPMOST, 1)
+					_window_ready = True
+					wlog("OpenCV window created OK, _window_ready=True")
+				except Exception as cv_err:
+					wlog(f"OpenCV window creation FAILED: {cv_err}")
+					show_window = False
+		else:
+			wlog("get_user_display returned no display — disabling window")
 			show_window = False
 
 	except Exception as e:
-		# Log the real error so future failures can be diagnosed
-		try:
-			with open("/var/log/howdy-window.log", "a") as f:
-				f.write(
-					f"{datetime.now(timezone.utc).isoformat()} "
-					f"window init exception: {e}\n"
-				)
-		except Exception:
-			pass
+		wlog(f"window init EXCEPTION: {e}")
 		show_window = False
+
+wlog(f"window init done: _window_ready={_window_ready}, show_window={show_window}")
+
+# Signal to the GNOME Shell extension that auth is starting.
+# The extension (howdy-screen@howdy) watches for this file and shows the
+# camera overlay above the lock screen when it appears.
+try:
+	open("/tmp/howdy-active", "w").close()
+except Exception:
+	pass
 
 # Let the ui know that we're ready
 send_to_ui("M", _("Identifying you..."))
@@ -387,20 +546,21 @@ while True:
 
 	# Form a string to let the user know we're real busy
 	ui_subtext = "Scanned " + str(valid_frames - dark_tries) + " frames"
-	if (dark_tries > 1):
+	if dark_tries > 1:
 		ui_subtext += " (skipped " + str(dark_tries) + " dark frames)"
-	# Show it in the ui as subtext
 	send_to_ui("S", ui_subtext)
 
 	# Stop if we've exceeded the time limit
 	if time.time() - timings["fr"] > timeout:
-		# Create a timeout snapshot if enabled
 		if save_failed:
 			make_snapshot(_("FAILED"))
 
 		if dark_tries == valid_frames:
 			print(_("All frames were too dark, please check dark_threshold in config"))
-			print(_("Average darkness: {avg}, Threshold: {threshold}").format(avg=str(dark_running_total / max(1, valid_frames)), threshold=str(dark_threshold)))
+			print(_("Average darkness: {avg}, Threshold: {threshold}").format(
+				avg=str(dark_running_total / max(1, valid_frames)),
+				threshold=str(dark_threshold)
+			))
 			exit(13)
 		else:
 			exit(11)
@@ -411,20 +571,21 @@ while True:
 
 	# If snapshots have been turned on
 	if save_failed or save_successful:
-		# Start capturing frames for the snapshot
 		if len(snapframes) < 3:
 			snapframes.append(frame)
 
 	# Create a histogram of the image with 8 values
 	hist = cv2.calcHist([gsframe], [0], None, [8], [0, 256])
-	# All values combined for percentage calculation
 	hist_total = np.sum(hist)
 
-	# Calculate frame darkness
-	darkness = (hist[0] / hist_total * 100)
+	# Calculate frame darkness.
+	# Use hist[0][0] (not hist[0]) to extract a true Python scalar — hist[0]
+	# is a 1-element numpy array and passing it to float() or round() raises
+	# a DeprecationWarning (error in future numpy versions).
+	darkness = float(hist[0][0] / hist_total * 100)
 
-	# If the image is fully black due to a bad camera read,
-	# skip to the next frame
+	# If the image is fully black due to a bad camera read, skip entirely.
+	# These frames have no usable data so we don't even show them in the window.
 	if (hist_total == 0) or (darkness == 100):
 		black_tries += 1
 		continue
@@ -432,19 +593,19 @@ while True:
 	dark_running_total += darkness
 	valid_frames += 1
 
-	# If the image exceeds darkness threshold due to subject distance,
-	# skip to the next frame
-	if (darkness > dark_threshold):
+	# Flag whether this frame is too dark for face recognition.
+	# We still scale, rotate, and display dark frames — only recognition is
+	# skipped — so the window always shows live camera output.
+	is_too_dark = darkness > dark_threshold
+	if is_too_dark:
 		dark_tries += 1
-		continue
 
-	# If the height is too high
+	# Scale and rotate — applied to ALL non-black frames so the window
+	# always shows a properly sized, oriented image.
 	if scaling_factor != 1:
-		# Apply that factor to the frame
 		frame = cv2.resize(frame, None, fx=scaling_factor, fy=scaling_factor, interpolation=cv2.INTER_AREA)
 		gsframe = cv2.resize(gsframe, None, fx=scaling_factor, fy=scaling_factor, interpolation=cv2.INTER_AREA)
 
-	# If camera is configured to rotate = 1, check portrait in addition to landscape
 	if rotate == 1:
 		if frames % 3 == 1:
 			frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
@@ -452,8 +613,6 @@ while True:
 		if frames % 3 == 2:
 			frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 			gsframe = cv2.rotate(gsframe, cv2.ROTATE_90_CLOCKWISE)
-
-	# If camera is configured to rotate = 2, check portrait orientation
 	elif rotate == 2:
 		if frames % 2 == 0:
 			frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
@@ -462,192 +621,125 @@ while True:
 			frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 			gsframe = cv2.rotate(gsframe, cv2.ROTATE_90_CLOCKWISE)
 
-	# Get all faces from that frame as encodings
-	# Upsamples 1 time
-	face_locations = face_detector(gsframe, 1)
-	# Loop through each face
-	for fl in face_locations:
-		if use_cnn:
-			fl = fl.rect
+	# Face recognition — only on frames bright enough for detection
+	face_locations = []
+	winning_fl = None
+	if not is_too_dark:
+		face_locations = face_detector(gsframe, 1)
+		for fl in face_locations:
+			if use_cnn:
+				fl = fl.rect
 
-		# Fetch the faces in the image
-		face_landmark = pose_predictor(frame, fl)
-		face_encoding = np.array(face_encoder.compute_face_descriptor(frame, face_landmark, 1))
+			face_landmark = pose_predictor(frame, fl)
+			face_encoding = np.array(face_encoder.compute_face_descriptor(frame, face_landmark, 1))
 
-		# Match this found face against a known face
-		matches = np.linalg.norm(encodings - face_encoding, axis=1)
+			matches = np.linalg.norm(encodings - face_encoding, axis=1)
+			match_index = np.argmin(matches)
+			match = matches[match_index]
 
-		# Get best match
-		match_index = np.argmin(matches)
-		match = matches[match_index]
+			if lowest_certainty > match:
+				lowest_certainty = match
 
-		# Update certainty if we have a new low
-		if lowest_certainty > match:
-			lowest_certainty = match
+			if 0 < match < video_certainty:
+				timings["tt"] = time.time() - timings["st"]
+				timings["fl"] = time.time() - timings["fr"]
+				winning_fl = fl
 
-		# Check if a match that's confident enough
-		if 0 < match < video_certainty:
-			timings["tt"] = time.time() - timings["st"]
-			timings["fl"] = time.time() - timings["fr"]
+				if end_report:
+					def print_timing(label, k):
+						"""Helper function to print a timing from the list"""
+						print("  %s: %dms" % (label, round(timings[k] * 1000)))
 
-			# If set to true in the config, print debug text
-			if end_report:
-				def print_timing(label, k):
-					"""Helper function to print a timing from the list"""
-					print("  %s: %dms" % (label, round(timings[k] * 1000)))
+					print(_("Time spent"))
+					print_timing(_("Starting up"), "in")
+					print(_("  Open cam + load libs: %dms") % (round(max(timings["ll"], timings["ic"]) * 1000, )))
+					print_timing(_("  Opening the camera"), "ic")
+					print_timing(_("  Importing recognition libs"), "ll")
+					print_timing(_("Searching for known face"), "fl")
+					print_timing(_("Total time"), "tt")
 
-				# Print a nice timing report
-				print(_("Time spent"))
-				print_timing(_("Starting up"), "in")
-				print(_("  Open cam + load libs: %dms") % (round(max(timings["ll"], timings["ic"]) * 1000, )))
-				print_timing(_("  Opening the camera"), "ic")
-				print_timing(_("  Importing recognition libs"), "ll")
-				print_timing(_("Searching for known face"), "fl")
-				print_timing(_("Total time"), "tt")
+					print(_("\nResolution"))
+					width = video_capture.fw or 1
+					print(_("  Native: %dx%d") % (height, width))
+					scale_height, scale_width = frame.shape[:2]
+					print(_("  Used: %dx%d") % (scale_height, scale_width))
 
-				print(_("\nResolution"))
-				width = video_capture.fw or 1
-				print(_("  Native: %dx%d") % (height, width))
-				# Save the new size for diagnostics
-				scale_height, scale_width = frame.shape[:2]
-				print(_("  Used: %dx%d") % (scale_height, scale_width))
+					print(_("\nFrames searched: %d (%.2f fps)") % (frames, frames / timings["fl"]))
+					print(_("Black frames ignored: %d ") % (black_tries, ))
+					print(_("Dark frames ignored: %d ") % (dark_tries, ))
+					print(_("Certainty of winning frame: %.3f") % (match * 10, ))
+					print(_("Winning model: %d (\"%s\")") % (match_index, models[match_index]["label"]))
 
-				# Show the total number of frames and calculate the FPS by dividing it by the total scan time
-				print(_("\nFrames searched: %d (%.2f fps)") % (frames, frames / timings["fl"]))
-				print(_("Black frames ignored: %d ") % (black_tries, ))
-				print(_("Dark frames ignored: %d ") % (dark_tries, ))
-				print(_("Certainty of winning frame: %.3f") % (match * 10, ))
+				if save_successful:
+					make_snapshot(_("SUCCESSFUL"))
 
-				print(_("Winning model: %d (\"%s\")") % (match_index, models[match_index]["label"]))
+				if config.getboolean("rubberstamps", "enabled", fallback=False):
+					import rubberstamps
+					send_to_ui("S", "")
+					if "gtk_proc" not in vars():
+						gtk_proc = None
+					rubberstamps.execute(config, gtk_proc, {
+						"video_capture": video_capture,
+						"face_detector": face_detector,
+						"pose_predictor": pose_predictor,
+						"clahe": clahe
+					})
 
-			# Make snapshot if enabled
-			if save_successful:
-				make_snapshot(_("SUCCESSFUL"))
+				# Render the winning frame with "Matched!" annotation before
+				# sleeping, so the window and GNOME Shell extension overlay are
+				# both visible even if this is the very first frame captured.
+				_do_imshow = show_window and _window_ready
+				if overlay or _do_imshow:
+					try:
+						if _do_imshow:
+							raise_window_once()
+						elapsed = round(time.time() - timings["fr"], 1)
+						render_frame_to_window(
+							frame.copy(),
+							[winning_fl],
+							True,   # is_match_found
+							False,  # is_too_dark
+							darkness,
+							elapsed,
+							do_imshow=_do_imshow
+						)
+					except Exception as render_err:
+						wlog(f"winning frame render error: {render_err}")
 
-			# Run rubberstamps if enabled
-			if config.getboolean("rubberstamps", "enabled", fallback=False):
-				import rubberstamps
+				wlog("match found — holding window for 0.8s before exit")
+				time.sleep(0.8)
+				exit(0)
 
-				send_to_ui("S", "")
-
-				if "gtk_proc" not in vars():
-					gtk_proc = None
-
-				rubberstamps.execute(config, gtk_proc, {
-					"video_capture": video_capture,
-					"face_detector": face_detector,
-					"pose_predictor": pose_predictor,
-					"clahe": clahe
-				})
-
-			# End peacefully
-			exit(0)
-  
-	# We render after the recognition loop so we can annotate:
-	#   • green circle  = face detected, currently matching
-	#   • orange circle = face detected, not yet matching
-	#   • certainty     = best score so far (lower = more certain, shown ×10)
-	#   • frame info    = elapsed time and frame count
+	# Frame rendering — runs for every non-black frame, including dark ones.
+	# Always writes the JPEG for the extension overlay; the OpenCV window is
+	# only drawn/raised when a usable X display exists (do_imshow).
 	#
-	# The entire block is wrapped in try/except — a display hiccup must
-	# never cause authentication to fail.
-	#
-	if show_window and _window_ready:
+	# Wrapped in try/except — a display hiccup must never block authentication.
+	_do_imshow = show_window and _window_ready
+	if overlay or _do_imshow:
 		try:
-			display_frame = frame.copy()
-
-			if display_frame.ndim == 2:
-				display_frame = cv2.cvtColor(display_frame, cv2.COLOR_GRAY2BGR)
-
 			elapsed = round(time.time() - timings["fr"], 1)
 			is_match_found = lowest_certainty < video_certainty
 
-			for fl in face_locations:
-				if use_cnn:
-					fl = fl.rect
-
-				box_color = (0, 255, 0) if is_match_found else (0, 165, 255)
-
-				# Compute circle center and radius from the bounding box
-				cx = (fl.left() + fl.right()) // 2
-				cy = (fl.top() + fl.bottom()) // 2
-				radius = max(fl.right() - fl.left(), fl.bottom() - fl.top()) // 2 + 8
-
-				cv2.circle(display_frame, (cx, cy), radius, box_color, 2)
-
-				label = "Matched" if is_match_found else "Scanning"
-				cv2.putText(
-					display_frame, label,
-					(cx - 30, cy - radius - 8),
-					cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1,
-					cv2.LINE_AA
-				)
-
-			if lowest_certainty < 10:
-				certainty_display = round(lowest_certainty * 10, 1)
-				hud_color = (0, 255, 0) if is_match_found else (200, 200, 200)
-				cv2.putText(
-					display_frame,
-					f"Certainty: {certainty_display}  (need < {round(video_certainty * 10, 1)})",
-					(8, 20),
-					cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_color, 1,
-					cv2.LINE_AA
-				)
-
-			cv2.putText(
-				display_frame,
-				f"Frame {frames}  |  {elapsed}s elapsed",
-				(8, display_frame.shape[0] - 8),
-				cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1,
-				cv2.LINE_AA
+			render_frame_to_window(
+				frame.copy(),
+				face_locations,
+				is_match_found,
+				is_too_dark,
+				darkness,
+				elapsed,
+				do_imshow=_do_imshow
 			)
 
-			cv2.imshow("Howdy", display_frame)
-			cv2.waitKey(1)
+			if _do_imshow:
+				raise_window_once()
 
-			# On the first rendered frame, force the window above GDM's shell.
-			# We set _NET_WM_STATE_ABOVE via xprop (which talks to the X server
-			# directly) and then raise the window with xdotool. Both tools must
-			# be installed: apt install x11-utils xdotool
-			if frames == 1:
-				try:
-					wid_result = subprocess.run(
-						["xdotool", "search", "--name", "Howdy"],
-						capture_output=True,
-						text=True
-					)
-					wid = wid_result.stdout.strip().split("\n")[0]
-					if wid:
-						# Set ABOVE + STAYS_ON_TOP so gnome-shell's compositor
-						# cannot bury the window beneath the login screen.
-						subprocess.Popen(
-							[
-								"xprop", "-id", wid,
-								"-f", "_NET_WM_STATE", "32a",
-								"-set", "_NET_WM_STATE",
-								"_NET_WM_STATE_ABOVE,_NET_WM_STATE_STAYS_ON_TOP"
-							],
-							stdout=subprocess.DEVNULL,
-							stderr=subprocess.DEVNULL
-						)
-						subprocess.Popen(
-							["xdotool", "windowraise", wid],
-							stdout=subprocess.DEVNULL,
-							stderr=subprocess.DEVNULL
-						)
-				except FileNotFoundError:
-					pass  # xdotool / xprop not installed — skip silently
+			if frames <= 6:
+				wlog(f"render loop frame {frames} — rendered (imshow={_do_imshow}), is_too_dark={is_too_dark}")
 
 		except Exception as e:
-			# Log window rendering errors without interrupting auth
-			try:
-				with open("/var/log/howdy-window.log", "a") as f:
-					f.write(
-						f"{datetime.now(timezone.utc).isoformat()} "
-						f"window render exception: {e}\n"
-					)
-			except Exception:
-				pass
+			wlog(f"frame render exception at frame {frames}: {e}")
+			# Disable the OpenCV window on error, but keep writing overlay frames.
 			show_window = False
 
 	if exposure != -1:
