@@ -182,7 +182,7 @@ def get_user_display(username):
 	return None, None
 
 
-def render_frame_to_window(display_frame, face_locs, is_match_found, is_too_dark, darkness, elapsed, do_imshow=True):
+def render_frame_to_window(display_frame, face_locs, is_match_found, is_too_dark, darkness, elapsed, do_imshow=True, do_mirror=False):
 	"""
 	Draw annotations onto display_frame and always write the frame as a JPEG
 	for the GNOME Shell lock-screen / greeter extension to pick up.
@@ -196,6 +196,9 @@ def render_frame_to_window(display_frame, face_locs, is_match_found, is_too_dark
 	if display_frame.ndim == 2:
 		display_frame = cv2.cvtColor(display_frame, cv2.COLOR_GRAY2BGR)
 
+	if do_mirror:
+		display_frame = cv2.flip(display_frame, 1)
+
 	if is_too_dark:
 		cv2.putText(
 			display_frame,
@@ -204,12 +207,14 @@ def render_frame_to_window(display_frame, face_locs, is_match_found, is_too_dark
 			cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 80, 220), 1, cv2.LINE_AA
 		)
 	else:
+		frame_w = display_frame.shape[1]
 		for fl in face_locs:
 			if use_cnn:
 				fl = fl.rect
 
 			box_color = (0, 255, 0) if is_match_found else (0, 165, 255)
-			cx = (fl.left() + fl.right()) // 2
+			raw_cx = (fl.left() + fl.right()) // 2
+			cx = (frame_w - 1 - raw_cx) if do_mirror else raw_cx
 			cy = (fl.top() + fl.bottom()) // 2
 			radius = max(fl.right() - fl.left(), fl.bottom() - fl.top()) // 2 + 8
 
@@ -354,6 +359,7 @@ show_window = config.getboolean("video", "show_window", fallback=False)
 # (lock screen + GDM greeter). Independent of show_window: the greeter has no
 # usable X display for cv2.imshow but still wants the JPEG frames.
 overlay = config.getboolean("video", "overlay", fallback=True)
+mirror = config.getboolean("video", "mirror", fallback=False)
 
 # Send the gtk output to the terminal if enabled in the config
 gtk_pipe = sys.stdout if gtk_stdout else subprocess.DEVNULL
@@ -701,7 +707,8 @@ while True:
 							False,  # is_too_dark
 							darkness,
 							elapsed,
-							do_imshow=_do_imshow
+							do_imshow=_do_imshow,
+							do_mirror=mirror
 						)
 					except Exception as render_err:
 						wlog(f"winning frame render error: {render_err}")
@@ -728,7 +735,8 @@ while True:
 				is_too_dark,
 				darkness,
 				elapsed,
-				do_imshow=_do_imshow
+				do_imshow=_do_imshow,
+				do_mirror=mirror
 			)
 
 			if _do_imshow:
