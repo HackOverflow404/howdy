@@ -142,6 +142,21 @@ howdy [-U user] [-y] command [argument]
 | `test`    | Test the camera and recognition methods       |
 | `version` | Print the current version number              |
 
+## Lock screen overlay (GNOME Shell)
+
+On GNOME desktops (GNOME 45+), Howdy can show the live camera feed and
+recognition status above the lock screen and GDM login screen while
+authentication runs. Enable it by setting `overlay = true` in the `[video]`
+section of the config, then install the bundled GNOME Shell extension:
+
+```bash
+cd howdy-gnome-extension
+./install.sh
+```
+
+See [`howdy-gnome-extension/README.md`](howdy-gnome-extension/README.md) for
+full setup instructions, Wayland compatibility notes, and distro requirements.
+
 ## Contributing [![](https://img.shields.io/travis/boltgolt/howdy/dev.svg?label=dev%20build)](https://github.com/boltgolt/howdy/tree/dev) [![](https://img.shields.io/github/issues-raw/boltgolt/howdy/enhancement.svg?label=feature+requests&colorB=4c1)](https://github.com/boltgolt/howdy/issues?q=is%3Aissue+is%3Aopen+label%3Aenhancement)
 
 The easiest ways to contribute to Howdy is by starring the repository and opening GitHub issues for features you'd like to see. If you want to do more, you can also [buy me a coffee](https://www.buymeacoffee.com/boltgolt).
