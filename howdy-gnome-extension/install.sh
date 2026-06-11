@@ -41,19 +41,24 @@ cat <<'EOF'
 
 Done.
 
-To activate:
+Next step — enable the overlay in the Howdy config:
+  sudo howdy config
+  # Set  overlay = true  in the [video] section, then save.
+
+To activate the extension:
   - User session + lock screen: log out and back in, OR (X11 only) press
     Alt+F2, type 'r', Enter to restart GNOME Shell.
   - GDM greeter: it picks up the new dconf on its next start. Force it now
     (this LOGS YOU OUT) with:  sudo systemctl restart gdm
 
 Test:
-  - Lock the screen (Super+L) and look at the camera — overlay should appear.
+  - Lock the screen (Super+L), then move your face in front of the camera to
+    trigger howdy — the overlay should appear above the lock screen.
   - Suspend + resume to the lock screen — same.
-  - Log fully out to the GDM greeter and trigger howdy.
+  - Log fully out to the GDM greeter and let howdy authenticate you there.
 
 Logs:
   journalctl -f -o cat /usr/bin/gnome-shell      # user shell
   journalctl -f _COMM=gnome-shell                # incl. greeter
-  sudo cat /tmp/howdy-debug.log                  # compare.py side
+  sudo cat /tmp/howdy-debug.log                  # compare.py side (needs overlay=true)
 EOF
