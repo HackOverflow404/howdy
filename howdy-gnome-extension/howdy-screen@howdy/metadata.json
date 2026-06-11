@@ -1,0 +1,8 @@
+{
+  "name": "Howdy Camera Overlay",
+  "description": "Shows the howdy IR camera feed above the lock screen and GDM login screen during face authentication",
+  "uuid": "howdy-screen@howdy",
+  "shell-version": ["45", "46", "47", "48"],
+  "session-modes": ["user", "unlock-dialog", "gdm"],
+  "version": 3
+}
