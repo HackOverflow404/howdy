@@ -182,6 +182,129 @@ def get_user_display(username):
 	return None, None
 
 
+def get_compositor(username):
+	"""
+	Scan the authenticating user's processes to detect the Wayland compositor.
+	Returns (compositor, env_extras):
+	  compositor — 'sway', 'hyprland', 'kde', 'gnome', 'x11', 'wayland', or None
+	  env_extras — env vars that must be forwarded to compositor CLI tools
+	              (e.g. SWAYSOCK for swaymsg, HYPRLAND_INSTANCE_SIGNATURE for hyprctl)
+
+	Runs only when show_window=True, so the /proc scan cost is paid at most once.
+	"""
+	import glob as _glob
+	import pwd as _pwd
+
+	try:
+		uid = _pwd.getpwnam(username).pw_uid
+	except KeyError:
+		return None, {}
+
+	compositor = None
+	session_type = None
+	env_extras = {}
+
+	for pid_dir in _glob.glob("/proc/[0-9]*"):
+		try:
+			if os.stat(pid_dir).st_uid != uid:
+				continue
+			with open(os.path.join(pid_dir, "environ"), "rb") as f:
+				proc_env = {}
+				for item in f.read().split(b"\x00"):
+					if b"=" in item:
+						k, _, v = item.partition(b"=")
+						proc_env[k.decode(errors="replace")] = v.decode(errors="replace")
+		except (PermissionError, FileNotFoundError, OSError):
+			continue
+
+		if not session_type:
+			xdg = proc_env.get("XDG_SESSION_TYPE", "").lower()
+			if xdg in ("x11", "wayland"):
+				session_type = xdg
+
+		# Compositor-specific fingerprints — highest-specificity first.
+		if "SWAYSOCK" in proc_env:
+			compositor = "sway"
+			env_extras = {k: proc_env[k] for k in ("SWAYSOCK", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR") if k in proc_env}
+			break
+		if "HYPRLAND_INSTANCE_SIGNATURE" in proc_env:
+			compositor = "hyprland"
+			env_extras = {k: proc_env[k] for k in ("HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR") if k in proc_env}
+			break
+		if compositor is None:
+			desktop = proc_env.get("XDG_CURRENT_DESKTOP", "").upper()
+			if "KDE" in desktop or "KDE_SESSION_VERSION" in proc_env:
+				compositor = "kde"
+			elif "GNOME" in desktop or "GNOME_SHELL_SESSION_MODE" in proc_env:
+				compositor = "gnome"
+
+	if compositor is None and session_type:
+		compositor = session_type  # 'x11' or generic 'wayland'
+
+	return compositor, env_extras
+
+
+def _raise_xdotool():
+	"""Raise via xdotool — works on X11 and via XWayland on KDE/generic Wayland."""
+	try:
+		wid_result = subprocess.run(
+			["xdotool", "search", "--pid", str(_own_pid)],
+			capture_output=True, text=True, timeout=2
+		)
+		wids = [w for w in wid_result.stdout.strip().split("\n") if w]
+		wlog(f"xdotool search result: {wids}")
+		if wids:
+			result = subprocess.run(
+				["xdotool", "windowraise", wids[-1]],
+				capture_output=True, text=True, timeout=2
+			)
+			wlog(f"xdotool windowraise exit={result.returncode}")
+		else:
+			wlog("xdotool: no windows found for our pid")
+	except FileNotFoundError:
+		wlog("xdotool not found — install xdotool for window raising")
+	except subprocess.TimeoutExpired:
+		wlog("xdotool timed out")
+
+
+def _raise_sway():
+	"""Raise via swaymsg — works for both native Wayland and XWayland windows in sway."""
+	try:
+		result = subprocess.run(
+			["swaymsg", f"[pid={_own_pid}] focus"],
+			env={**os.environ, **_compositor_env},
+			capture_output=True, text=True, timeout=2
+		)
+		wlog(f"swaymsg focus exit={result.returncode} stderr={result.stderr.strip()!r}")
+		if result.returncode != 0:
+			wlog("swaymsg failed — falling back to xdotool")
+			_raise_xdotool()
+	except FileNotFoundError:
+		wlog("swaymsg not found — falling back to xdotool")
+		_raise_xdotool()
+	except subprocess.TimeoutExpired:
+		wlog("swaymsg timed out")
+
+
+def _raise_hyprland():
+	"""Raise via hyprctl — Hyprland supports focusing windows by PID."""
+	try:
+		result = subprocess.run(
+			["hyprctl", "dispatch", "focuswindow", f"pid:{_own_pid}"],
+			env={**os.environ, **_compositor_env},
+			capture_output=True, text=True, timeout=2
+		)
+		wlog(f"hyprctl focuswindow exit={result.returncode} stderr={result.stderr.strip()!r}")
+		if result.returncode != 0:
+			wlog("hyprctl failed — falling back to xdotool")
+			_raise_xdotool()
+	except FileNotFoundError:
+		wlog("hyprctl not found — falling back to xdotool")
+		_raise_xdotool()
+	except subprocess.TimeoutExpired:
+		wlog("hyprctl timed out")
+
+
 def render_frame_to_window(display_frame, face_locs, is_match_found, is_too_dark, darkness, elapsed, do_imshow=True, do_mirror=False):
 	"""
 	Draw annotations onto display_frame and always write the frame as a JPEG
@@ -249,8 +372,8 @@ def render_frame_to_window(display_frame, face_locs, is_match_found, is_too_dark
 		cv2.imshow("Howdy", display_frame)
 		cv2.waitKey(1)
 
-	# Write the current frame as JPEG for the GNOME Shell lock-screen extension.
-	# Uses a temp file + atomic rename so the extension never reads a partial JPEG.
+	# Write the current frame as JPEG to /tmp/howdy-frame.jpg.
+	# Uses a temp file + atomic rename so the reader never sees a partial JPEG.
 	try:
 		_ok, _buf = cv2.imencode(".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
 		if _ok:
@@ -265,7 +388,13 @@ def raise_window_once():
 	"""
 	Raise the Howdy window to the top of the stacking order.
 	Safe to call multiple times — only acts on the first call.
-	Searches by PID so it always finds our own window, not stale ones.
+	Dispatches to the right tool based on the detected compositor:
+	  sway      → swaymsg  (with xdotool fallback)
+	  hyprland  → hyprctl  (with xdotool fallback)
+	  kde/x11   → xdotool  (KDE's XWayland support handles this well)
+	  gnome     → xdotool  (may not raise above compositor surfaces;
+	                         overlay=true is the recommended approach)
+	  unknown   → xdotool  (XWayland is almost always present)
 
 	Note: override_redirect is intentionally NOT used here. It strips WM
 	decorations and causes the camera content to overflow the window boundary.
@@ -277,28 +406,17 @@ def raise_window_once():
 	if _window_raised:
 		return
 	_window_raised = True
-	wlog(f"raise_window_once — raising window (pid={_own_pid})")
-	try:
-		wid_result = subprocess.run(
-			["xdotool", "search", "--pid", str(_own_pid)],
-			capture_output=True, text=True, timeout=2
-		)
-		wids = [w for w in wid_result.stdout.strip().split("\n") if w]
-		wlog(f"xdotool search --pid result: {wids}")
+	wlog(f"raise_window_once — compositor={_compositor!r}, pid={_own_pid}")
 
-		if wids:
-			wid = wids[-1]
-			raise_result = subprocess.run(
-				["xdotool", "windowraise", wid],
-				capture_output=True, text=True, timeout=2
-			)
-			wlog(f"windowraise exit={raise_result.returncode}")
-		else:
-			wlog("xdotool --pid search found no windows for our pid")
-	except FileNotFoundError:
-		wlog("xdotool not found")
-	except subprocess.TimeoutExpired:
-		wlog("xdotool timed out")
+	if _compositor == "sway":
+		_raise_sway()
+	elif _compositor == "hyprland":
+		_raise_hyprland()
+	else:
+		_raise_xdotool()
+		if _compositor == "gnome":
+			wlog("GNOME Wayland: xdotool raises the XWayland window but cannot "
+			     "lift it above compositor surfaces — consider using overlay=true")
 
 
 # Make sure we were given an username to test against
@@ -358,8 +476,9 @@ show_window = config.getboolean("video", "show_window", fallback=False)
 # Whether to write /tmp/howdy-frame.jpg for the GNOME Shell extension overlay
 # (lock screen + GDM greeter). Independent of show_window: the greeter has no
 # usable X display for cv2.imshow but still wants the JPEG frames.
-overlay = config.getboolean("video", "overlay", fallback=True)
+overlay = config.getboolean("video", "overlay", fallback=False)
 mirror = config.getboolean("video", "mirror", fallback=False)
+_overlay_debug = show_window or overlay
 
 # Send the gtk output to the terminal if enabled in the config
 gtk_pipe = sys.stdout if gtk_stdout else subprocess.DEVNULL
@@ -431,11 +550,14 @@ clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 # creating any window. A broad try/except ensures a display failure
 # never blocks authentication.
 
-# Debug log — written at every step. Check with: sudo cat /tmp/howdy-debug.log
+# Debug log — written only when overlay or show_window is enabled.
+# Check with: sudo cat /tmp/howdy-debug.log
 _LOG = "/tmp/howdy-debug.log"
 
 def wlog(msg):
 	"""Append a timestamped line to the debug log, never raises."""
+	if not _overlay_debug:
+		return
 	try:
 		with open(_LOG, "a") as f:
 			f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
@@ -444,6 +566,8 @@ def wlog(msg):
 
 _window_ready = False
 _window_raised = False
+_compositor = None    # detected by get_compositor(); used in raise_window_once()
+_compositor_env = {}  # extra env vars forwarded to compositor CLI tools
 _own_pid = os.getpid()
 
 wlog(f"=== howdy window init start, user='{user}', show_window={show_window}, pid={_own_pid} ===")
@@ -453,6 +577,9 @@ if show_window:
 		wlog("calling get_user_display...")
 		display, xauthority = get_user_display(user)
 		wlog(f"get_user_display returned display={display!r}, xauthority={xauthority!r}")
+
+		_compositor, _compositor_env = get_compositor(user)
+		wlog(f"get_compositor returned compositor={_compositor!r}, env_keys={list(_compositor_env)}")
 
 		if display:
 			os.environ["DISPLAY"] = display
