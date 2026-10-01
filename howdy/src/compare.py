@@ -12,6 +12,20 @@ timings = {
 # Import required modules
 import sys
 import os
+import fcntl
+
+# When compare.py runs as uid 0 inside a socket-activated service (e.g.
+# polkit-agent-helper-1), fd 1 is the polkit wire-protocol socket. Any unexpected
+# bytes on that fd — including Qt / GLib warnings from cv2 — corrupt the protocol
+# and cause pkexec to return "Not authorized". Redirect fd 1 to /dev/null before
+# cv2 is imported so Qt never gets a chance to write there. fd 2 (stderr → journal)
+# is left alone so wlog and error output still land somewhere useful.
+# We cannot rely on INVOCATION_ID because pam_howdy.so may sanitise the environment
+# before exec'ing us, so we use uid == 0 as the proxy for "running in a service".
+if os.getuid() == 0:
+    _devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(_devnull, 1)
+    os.close(_devnull)
 import json
 import configparser
 import dlib
@@ -34,9 +48,9 @@ def exit(code=None):
 	if "gtk_proc" in globals():
 		gtk_proc.terminate()
 
-	# Remove the active-auth signal file so the GNOME Shell extension
-	# knows authentication has ended and closes the camera overlay.
-	for _f in ("/tmp/howdy-active", "/tmp/howdy-frame.jpg", "/tmp/howdy-frame.jpg.tmp"):
+	# Remove the active-auth signal file so the lock screen overlay
+	# (Quickshell QML / GNOME Shell extension) closes the camera feed.
+	for _f in ("/run/howdy-active", "/run/howdy-frame.jpg", "/run/howdy-frame.jpg.tmp"):
 		try:
 			os.remove(_f)
 		except Exception:
@@ -287,33 +301,55 @@ def _raise_sway():
 
 
 def _raise_hyprland():
-	"""Raise via hyprctl — Hyprland supports focusing windows by PID."""
-	try:
-		result = subprocess.run(
-			["hyprctl", "dispatch", "focuswindow", f"pid:{_own_pid}"],
-			env={**os.environ, **_compositor_env},
-			capture_output=True, text=True, timeout=2
-		)
-		wlog(f"hyprctl focuswindow exit={result.returncode} stderr={result.stderr.strip()!r}")
-		if result.returncode != 0:
-			wlog("hyprctl failed — falling back to xdotool")
-			_raise_xdotool()
-	except FileNotFoundError:
+	"""Float, focus, bring-to-top, and pin the Howdy window on Hyprland.
+
+	Four dispatches run in sequence so the window:
+	  1. becomes floating (leaves the tile grid)     — setfloating pid:X
+	  2. receives keyboard/input focus               — focuswindow  pid:X
+	  3. is raised to the top of the Z-order         — bringactivetotop
+	  4. stays visible across workspace switches     — pin
+	Falls back to xdotool when hyprctl is absent or the window not yet visible.
+	"""
+	env = {**os.environ, **_compositor_env}
+
+	def _hctl(*args):
+		try:
+			r = subprocess.run(
+				["hyprctl", "dispatch"] + list(args),
+				env=env, capture_output=True, text=True, timeout=2
+			)
+			wlog(f"hyprctl dispatch {' '.join(args)} exit={r.returncode}")
+			return r.returncode == 0
+		except FileNotFoundError:
+			return None   # hyprctl binary missing
+		except subprocess.TimeoutExpired:
+			wlog(f"hyprctl dispatch {args[0]} timed out")
+			return False
+
+	ok = _hctl("setfloating", f"pid:{_own_pid}")
+	if ok is None:
 		wlog("hyprctl not found — falling back to xdotool")
 		_raise_xdotool()
-	except subprocess.TimeoutExpired:
-		wlog("hyprctl timed out")
+		return
+
+	_hctl("focuswindow", f"pid:{_own_pid}")
+	_hctl("bringactivetotop")
+	_hctl("pin")
+
+	if not ok:
+		wlog("hyprctl setfloating failed — also trying xdotool as fallback")
+		_raise_xdotool()
 
 
 def render_frame_to_window(display_frame, face_locs, is_match_found, is_too_dark, darkness, elapsed, do_imshow=True, do_mirror=False):
 	"""
 	Draw annotations onto display_frame and always write the frame as a JPEG
-	for the GNOME Shell lock-screen / greeter extension to pick up.
+	for the lock screen overlay (Quickshell QML / GNOME Shell extension) to pick up.
 
 	The annotation drawing and JPEG encode are pure numpy/OpenCV and need no
 	display, so they run everywhere. Only cv2.imshow() needs an X server, so it
-	is gated by do_imshow — at the Wayland GDM greeter we still want the JPEG
-	frames for the extension even though no OpenCV window can be drawn.
+	is gated by do_imshow — on Wayland lock screens we still want the JPEG
+	frames for the overlay even though no OpenCV window can be drawn.
 	Called both from the main loop and from the winning-frame path before exit(0).
 	"""
 	if display_frame.ndim == 2:
@@ -372,14 +408,26 @@ def render_frame_to_window(display_frame, face_locs, is_match_found, is_too_dark
 		cv2.imshow("Howdy", display_frame)
 		cv2.waitKey(1)
 
-	# Write the current frame as JPEG to /tmp/howdy-frame.jpg.
+	# Write the current frame as JPEG to /run/howdy-frame.jpg.
 	# Uses a temp file + atomic rename so the reader never sees a partial JPEG.
+	#
+	# The file must be world-readable (0644): the GNOME greeter overlay runs as
+	# the unprivileged "gdm" user, while compare.py runs as root under PAM with
+	# a restrictive umask (often 0077), which would otherwise create a 0600 file
+	# the greeter cannot read. We chmod the temp file explicitly so the perms are
+	# correct the instant the atomic rename publishes it. See the privacy note in
+	# the extension README — this exposes frames to local users during auth.
 	try:
 		_ok, _buf = cv2.imencode(".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
 		if _ok:
-			with open("/tmp/howdy-frame.jpg.tmp", "wb") as _fh:
+			_tmp = "/run/howdy-frame.jpg.tmp"
+			with open(_tmp, "wb") as _fh:
 				_fh.write(_buf.tobytes())
-			os.replace("/tmp/howdy-frame.jpg.tmp", "/tmp/howdy-frame.jpg")
+			try:
+				os.chmod(_tmp, 0o644)
+			except OSError:
+				pass
+			os.replace(_tmp, "/run/howdy-frame.jpg")
 	except Exception:
 		pass
 
@@ -473,12 +521,63 @@ save_successful = config.getboolean("snapshots", "save_successful", fallback=Fal
 gtk_stdout = config.getboolean("debug", "gtk_stdout", fallback=False)
 rotate = config.getint("video", "rotate", fallback=0)
 show_window = config.getboolean("video", "show_window", fallback=False)
-# Whether to write /tmp/howdy-frame.jpg for the GNOME Shell extension overlay
+# Whether to write /run/howdy-frame.jpg for the GNOME Shell extension overlay
 # (lock screen + GDM greeter). Independent of show_window: the greeter has no
 # usable X display for cv2.imshow but still wants the JPEG frames.
 overlay = config.getboolean("video", "overlay", fallback=False)
 mirror = config.getboolean("video", "mirror", fallback=False)
 _overlay_debug = show_window or overlay
+
+# Debug log — written only when overlay or show_window is enabled.
+# Check with: sudo cat /tmp/howdy-debug.log
+# Defined here (before the camera opens) so the camera-lock helper below can
+# log too.
+_LOG = "/tmp/howdy-debug.log"
+
+def wlog(msg):
+	"""Append a timestamped line to the debug log, never raises."""
+	if not _overlay_debug:
+		return
+	try:
+		with open(_LOG, "a") as f:
+			f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
+	except Exception:
+		pass
+
+# Serialize camera access across concurrent howdy invocations.
+#
+# PAM/polkit can spawn several compare.py processes in quick succession (for
+# example a polkit auth-retry storm). They would all race to stream from the
+# single V4L2 camera; the losers fail with "cannot open camera" (exit 14),
+# which polkit treats as another failure and retries at once — a runaway loop.
+# Holding an exclusive flock means only one instance touches the camera at a
+# time; the others wait for it to finish (bounded by max_wait) instead of
+# stampeding the device and instantly failing. Fully fail-open: any error here
+# just proceeds without the lock, exactly as before.
+_cam_lock_fh = None
+
+def acquire_camera_lock(max_wait):
+	"""Take an exclusive lock on the camera, waiting up to max_wait seconds."""
+	global _cam_lock_fh
+	try:
+		_cam_lock_fh = open("/run/howdy.lock", "w")
+		try:
+			os.chmod("/run/howdy.lock", 0o644)
+		except OSError:
+			pass
+		deadline = time.time() + max_wait
+		while True:
+			try:
+				fcntl.flock(_cam_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+				wlog("camera lock acquired")
+				return
+			except OSError:
+				if time.time() >= deadline:
+					wlog("camera lock wait timed out — proceeding without it")
+					return
+				time.sleep(0.1)
+	except Exception as e:
+		wlog(f"camera lock unavailable ({e}) — proceeding without it")
 
 # Send the gtk output to the terminal if enabled in the config
 gtk_pipe = sys.stdout if gtk_stdout else subprocess.DEVNULL
@@ -504,7 +603,12 @@ lock = thread.allocate_lock()
 lock.acquire()
 thread.start_new_thread(init_detector, (lock, ))
 
-# Start video capture on the IR camera
+# Start video capture on the IR camera.
+# Take the camera lock first so concurrent howdy processes don't stampede the
+# device (see acquire_camera_lock). Wait a little longer than one scan timeout
+# so a waiter outlasts the current holder's scan instead of giving up early.
+acquire_camera_lock(timeout + 2)
+
 timings["ic"] = time.time()
 
 video_capture = VideoCapture(config)
@@ -550,20 +654,6 @@ clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 # creating any window. A broad try/except ensures a display failure
 # never blocks authentication.
 
-# Debug log — written only when overlay or show_window is enabled.
-# Check with: sudo cat /tmp/howdy-debug.log
-_LOG = "/tmp/howdy-debug.log"
-
-def wlog(msg):
-	"""Append a timestamped line to the debug log, never raises."""
-	if not _overlay_debug:
-		return
-	try:
-		with open(_LOG, "a") as f:
-			f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
-	except Exception:
-		pass
-
 _window_ready = False
 _window_raised = False
 _compositor = None    # detected by get_compositor(); used in raise_window_once()
@@ -574,14 +664,30 @@ wlog(f"=== howdy window init start, user='{user}', show_window={show_window}, pi
 
 if show_window:
 	try:
-		wlog("calling get_user_display...")
-		display, xauthority = get_user_display(user)
-		wlog(f"get_user_display returned display={display!r}, xauthority={xauthority!r}")
+		# Qt (cv2's highgui backend) refuses to create windows when
+		# euid != uid — always true in PAM/sudo (euid=root, uid=user).
+		# Also skip when running as full root inside a systemd service
+		# (e.g. polkit-agent-helper-1) — Qt crashes in that restricted context.
+		# The overlay service shows the feed instead.
+		if os.geteuid() != os.getuid():
+			wlog("running setuid (PAM/sudo) — show_window disabled; overlay service provides display")
+			show_window = False
+		elif os.getuid() == 0:
+			wlog("running as uid 0 (service/root) — show_window disabled; overlay service provides display")
+			show_window = False
+		else:
+			wlog("calling get_user_display...")
+			display, xauthority = get_user_display(user)
+			wlog(f"get_user_display returned display={display!r}, xauthority={xauthority!r}")
 
-		_compositor, _compositor_env = get_compositor(user)
-		wlog(f"get_compositor returned compositor={_compositor!r}, env_keys={list(_compositor_env)}")
+			_compositor, _compositor_env = get_compositor(user)
+			wlog(f"get_compositor returned compositor={_compositor!r}, env_keys={list(_compositor_env)}")
 
-		if display:
+		if show_window and not display:
+			wlog("get_user_display returned no display — disabling window")
+			show_window = False
+
+		if show_window and display:
 			os.environ["DISPLAY"] = display
 			wlog(f"set DISPLAY={display}")
 
@@ -646,21 +752,22 @@ if show_window:
 				except Exception as cv_err:
 					wlog(f"OpenCV window creation FAILED: {cv_err}")
 					show_window = False
-		else:
-			wlog("get_user_display returned no display — disabling window")
-			show_window = False
-
 	except Exception as e:
 		wlog(f"window init EXCEPTION: {e}")
 		show_window = False
 
 wlog(f"window init done: _window_ready={_window_ready}, show_window={show_window}")
 
-# Signal to the GNOME Shell extension that auth is starting.
-# The extension (howdy-screen@howdy) watches for this file and shows the
-# camera overlay above the lock screen when it appears.
+# Signal to the lock screen overlay that auth is starting.
+# The Quickshell lock QML and the GNOME Shell extension (howdy-screen@howdy)
+# both watch for this file and show the camera feed when it appears.
+# Make it world-readable (0644) — the overlay may run as a different user.
 try:
-	open("/tmp/howdy-active", "w").close()
+	open("/run/howdy-active", "w").close()
+	try:
+		os.chmod("/run/howdy-active", 0o644)
+	except OSError:
+		pass
 except Exception:
 	pass
 

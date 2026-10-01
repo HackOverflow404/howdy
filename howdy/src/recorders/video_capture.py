@@ -6,6 +6,7 @@ import configparser
 import cv2
 import os
 import sys
+import time
 
 from i18n import _
 
@@ -119,11 +120,20 @@ class VideoCapture:
 			)
 
 		else:
-			# Start video capture on the IR camera through OpenCV
-			self.internal = cv2.VideoCapture(
-				self.config.get("video", "device_path"),
-				cv2.CAP_V4L
-			)
+			# Start video capture on the IR camera through OpenCV.
+			#
+			# PAM/polkit may spawn several howdy processes in quick succession,
+			# so a previous instance can still be releasing this (single-stream)
+			# V4L2 device. Retry the open briefly instead of accepting a dead
+			# capture — failing instantly makes polkit retry at once, which can
+			# spiral into a camera-open loop.
+			device_path = self.config.get("video", "device_path")
+			self.internal = cv2.VideoCapture(device_path, cv2.CAP_V4L)
+			_open_deadline = time.time() + 2
+			while not self.internal.isOpened() and time.time() < _open_deadline:
+				self.internal.release()
+				time.sleep(0.2)
+				self.internal = cv2.VideoCapture(device_path, cv2.CAP_V4L)
 			# Set the capture frame rate
 			# Without this the first detected (and possibly lower) frame rate is used, -1 seems to select the highest
 			# Use 0 as a fallback to avoid breaking an existing setup, new installs should default to -1

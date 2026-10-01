@@ -1,20 +1,32 @@
 /**
- * Howdy Camera Overlay — GNOME Shell Extension (GNOME 45–48)
+ * Howdy Camera Overlay — GNOME Shell Extension (GNOME 45–50, Wayland & X11)
  *
  * Shows the howdy camera feed above the lock screen ("unlock-dialog") and the
  * GDM login screen ("gdm") while face authentication is in progress. When you
- * are logged in normally ("user" mode) the overlay stays hidden, because
- * compare.py shows its own OpenCV window there — flip SHOW_IN_USER_MODE to
- * true if you want the extension overlay in that case too.
+ * are logged in normally ("user" mode) the overlay also shows by default,
+ * because compare.py runs as root under sudo/pkexec and usually has no display
+ * access, so its OpenCV window never appears — flip SHOW_IN_USER_MODE to false
+ * if you would rather rely on that window in a logged-in session.
+ *
+ * This is the only overlay mechanism that works on the GNOME lock screen and
+ * greeter, on both Wayland (the only session type in Ubuntu 26.04 / GNOME 50)
+ * and X11. It runs entirely inside gnome-shell and never touches the display
+ * server directly, so the same code path serves every compositor backend.
  *
  * Protocol (written by compare.py):
  *   /tmp/howdy-active    — created when auth starts, deleted when it ends
- *   /tmp/howdy-frame.jpg — JPEG frame, atomically replaced each render tick
+ *   /tmp/howdy-frame.jpg — JPEG frame (mode 0644), atomically replaced per tick
  *
  * Frames are loaded with GdkPixbuf and pushed straight into a Clutter content
  * via St.ImageContent. We deliberately do NOT use St.Icon + Gio.FileIcon:
  * StTextureCache caches gicon textures by URI with no file-change monitor, so
  * the overlay would freeze on the very first frame.
+ *
+ * GNOME version compatibility:
+ *   - St.ImageContent is available on GNOME 45+ (Clutter.Image was removed).
+ *   - GNOME 48 changed St.ImageContent.set_bytes() to take a Cogl.Context as
+ *     its first argument. We detect the context once (see _coglContext) and use
+ *     the matching call: the new form on 48+, the legacy form on 45–47.
  */
 
 import GLib from 'gi://GLib';
@@ -32,17 +44,24 @@ const POLL_MS     = 100;   // how often to reload the frame while active
 const CHECK_MS    = 250;   // how often to check whether auth is active
 const DISPLAY_W   = 360;   // overlay width in px; height follows the aspect ratio
 
-// Show the overlay while logged in (normal "user" session) too. Left false so
-// the logged-in experience stays the OpenCV window that compare.py opens.
-const SHOW_IN_USER_MODE = false;
+// Show the overlay while logged in (normal "user" session) too. True because
+// compare.py runs as root under sudo/pkexec and has no display access, so its
+// OpenCV window never appears — the GNOME Shell extension overlay is the only
+// reliable visual feedback in that case.
+const SHOW_IN_USER_MODE = true;
+
+// Sentinel meaning "Cogl context not looked up yet". Distinct from null, which
+// means "looked up and unavailable" (GNOME 45–47, legacy set_bytes signature).
+const COGL_UNRESOLVED = undefined;
 
 export default class HowdyCameraOverlay {
     enable() {
-        this._overlay   = null;
-        this._frame     = null;
-        this._watchId   = null;
-        this._pollId    = null;
-        this._frameTime = 0;
+        this._overlay     = null;
+        this._frame       = null;
+        this._watchId     = null;
+        this._pollId      = null;
+        this._frameTime   = 0;
+        this._coglContext = COGL_UNRESOLVED;
 
         // Poll for /tmp/howdy-active appearing/disappearing, and for the
         // session mode allowing the overlay.
@@ -76,13 +95,55 @@ export default class HowdyCameraOverlay {
         return true;
     }
 
+    /**
+     * The Cogl context required by St.ImageContent.set_bytes() on GNOME 48+.
+     * Looked up once and cached: returns the context object on 48+, or null on
+     * 45–47 (and on any shell where the lookup path is unavailable), in which
+     * case the caller uses the legacy set_bytes signature. Resolving this once
+     * avoids throwing — and catching — an exception on every single frame.
+     */
+    _getCoglContext() {
+        if (this._coglContext !== COGL_UNRESOLVED)
+            return this._coglContext;
+
+        let ctx = null;
+        try {
+            ctx = global.stage?.context?.get_backend?.()?.get_cogl_context?.() ?? null;
+        } catch (_) {
+            ctx = null;
+        }
+        this._coglContext = ctx;
+        return ctx;
+    }
+
+    /**
+     * Lay a St.BoxLayout out vertically across GNOME versions. GNOME 48
+     * deprecated the `vertical` property in favour of `orientation`
+     * (Clutter.Orientation) and it is slated for removal around GNOME 50;
+     * `orientation` in turn does not exist before 48. We detect which property
+     * the running shell actually has and set only that one, avoiding both a
+     * hard failure on 50 and deprecation warnings on 48+.
+     */
+    _setVertical(box) {
+        let hasOrientation = false;
+        try {
+            hasOrientation = !!St.BoxLayout.find_property?.('orientation');
+        } catch (_) {
+            hasOrientation = false;
+        }
+        if (hasOrientation)
+            box.orientation = Clutter.Orientation.VERTICAL;
+        else
+            box.vertical = true;
+    }
+
     _showOverlay() {
         this._overlay = new St.BoxLayout({
-            vertical: true,
             style: 'background-color: rgba(0,0,0,0.80);' +
                    'border-radius: 12px; padding: 10px; spacing: 6px;',
             reactive: false,
         });
+        this._setVertical(this._overlay);
 
         const label = new St.Label({
             text: 'Howdy — identifying you…',
@@ -155,20 +216,39 @@ export default class HowdyCameraOverlay {
         } catch (_) {
             return; // mid-write / momentarily unreadable — retry next tick
         }
+        if (!pixbuf)
+            return;
         this._frameTime = stamp;
 
         const w = pixbuf.get_width();
         const h = pixbuf.get_height();
+        if (w <= 0 || h <= 0)
+            return;
         const fmt = pixbuf.get_has_alpha()
             ? Cogl.PixelFormat.RGBA_8888
             : Cogl.PixelFormat.RGB_888;
 
         const content = St.ImageContent.new_with_preferred_size(w, h);
-        const ok = content.set_bytes(
-            GLib.Bytes.new(pixbuf.get_pixels()),
-            fmt, w, h, pixbuf.get_rowstride());
-        if (!ok)
-            return;
+
+        // GNOME 48 added a leading Cogl.Context argument to set_bytes(); 45–47
+        // use the legacy signature. _getCoglContext() tells the two apart.
+        const coglContext = this._getCoglContext();
+        try {
+            if (coglContext) {
+                content.set_bytes(
+                    coglContext,
+                    pixbuf.read_pixel_bytes(),
+                    fmt, w, h, pixbuf.get_rowstride());
+            } else {
+                const ok = content.set_bytes(
+                    GLib.Bytes.new(pixbuf.get_pixels()),
+                    fmt, w, h, pixbuf.get_rowstride());
+                if (!ok)
+                    return;
+            }
+        } catch (_) {
+            return; // bad frame / transient encode mismatch — try again next tick
+        }
 
         this._frame.set_content(content);
         this._frame.set_size(DISPLAY_W, Math.round(DISPLAY_W * h / w));

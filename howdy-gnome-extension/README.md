@@ -1,4 +1,10 @@
-# Howdy Camera Overlay (GNOME Shell extension)
+# Howdy Camera Overlay (GNOME Shell extension — GNOME only)
+
+> **Not on GNOME?** If you are running **Hyprland + caelestia** (Quickshell
+> lock screen), see `howdy-wayland-overlay/` instead — the caelestia lock
+> screen QML integrates Howdy natively via a built-in PamContext. The GNOME
+> Shell extension is only for GNOME Shell sessions.
+
 
 Shows the howdy camera feed **above the lock screen and the GDM login screen**
 while face authentication runs. On the normal logged-in desktop, `compare.py`
@@ -7,13 +13,23 @@ already opens its own OpenCV window, so the overlay stays hidden there (toggle
 
 ## Requirements
 
-**GNOME Shell 45 or newer.** The extension uses the ESM (ECMAScript Modules)
+**GNOME Shell 45 through 50.** The extension uses the ESM (ECMAScript Modules)
 format introduced in GNOME 45. Earlier versions used a different, incompatible
 API and are not supported.
 
+It is tested across the API breaks that landed in this range and adapts to the
+running shell at runtime:
+
+- **GNOME 48** changed `St.ImageContent.set_bytes()` to take a `Cogl.Context`
+  as its first argument — the extension detects the context once and uses the
+  new form on 48–50, the legacy form on 45–47.
+- **GNOME 48** also deprecated the `St.BoxLayout` `vertical` property in favour
+  of `orientation` (removed around GNOME 50) — the extension sets whichever the
+  shell actually exposes.
+
 | Distro               | Min. version    | Notes                                   |
 |----------------------|-----------------|-----------------------------------------|
-| Ubuntu               | 23.10 (Mantic)  | 22.04 LTS ships GNOME 42 — not supported |
+| Ubuntu               | 23.10 (Mantic)  | 22.04 LTS ships GNOME 42 — not supported. 26.04 LTS ships GNOME 50 (Wayland-only) — supported |
 | Fedora               | 39              |                                         |
 | Arch Linux           | rolling         | Always current                          |
 | Debian               | Trixie (13)     | Bookworm ships GNOME 43 — not supported  |
@@ -22,8 +38,24 @@ API and are not supported.
 ## Wayland compatibility
 
 The extension is **fully Wayland-native** — it runs inside gnome-shell and does
-not touch X11. Set `overlay = true` and use the extension for the best experience
-on any compositor.
+not touch the display server, so the identical code path serves both the
+Wayland and X11 backends. On Ubuntu 26.04 / GNOME 50 the desktop runs on Wayland
+only (GNOME Shell no longer offers an X.org session), and the extension is the
+recommended overlay there. Set `overlay = true` and use the extension for the
+best experience on any GNOME backend.
+
+### Which overlay works where
+
+The **lock-screen / greeter overlay is GNOME-only** — it is a GNOME Shell
+extension, so KDE Plasma, sway, Hyprland and other compositors cannot load it
+and have no equivalent way to inject a surface above their own lock screens.
+For logged-in (unlocked) sessions on those compositors, use `show_window`
+instead (OpenCV popup via XWayland — see below).
+
+| Session state            | GNOME (Wayland/X11)            | Hyprland + caelestia          | KDE / sway / other  |
+|--------------------------|--------------------------------|-------------------------------|---------------------|
+| **Lock screen**          | extension overlay (`overlay`)  | Quickshell QML + PamContext   | not available       |
+| **Logged-in (sudo etc.)**| extension overlay (`overlay`)  | `howdy-wayland-overlay` svc   | `show_window` (XWayland) |
 
 The `show_window` config option (OpenCV popup during sudo / polkit in a logged-in
 session) creates a window via **XWayland**, which is present on virtually all

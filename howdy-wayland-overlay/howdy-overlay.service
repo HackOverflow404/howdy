@@ -1,0 +1,10 @@
+[Unit]
+Description=Howdy camera overlay for face authentication
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/howdy-overlay/howdy-overlay.py
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+Environment=LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0
